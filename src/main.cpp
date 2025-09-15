@@ -1,0 +1,186 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <mqtt_client.h>
+#include <Wire.h>
+#include <NewPing.h>
+
+#define SSID "Sauron"
+#define PASSWORD "gamaujawab"
+#define LINE_CODE "line1"
+#define PIN_EMERGENCY_BUTTON 14
+#define PIN_LOAD_BUTTON 27
+#define PIN_LED 2
+#define PIN_TRIGGER 12
+#define PIN_ECHO 13
+#define LOAD_PRESS_TIME 100
+
+struct lineData {
+  bool status;  
+  bool bucket;
+  bool emergency;
+};
+
+lineData line = {false, false, false};
+
+bool isLoaded = false;
+
+esp_mqtt_client_handle_t mqtt;
+
+NewPing sonar(PIN_TRIGGER, PIN_ECHO, 30);
+
+wl_status_t wifiStatus;
+
+void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+void handle_wifi_loop();
+void handle_mqtt_message(esp_mqtt_event_handle_t message);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_EMERGENCY_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_LOAD_BUTTON, INPUT_PULLUP);
+
+  WiFi.setHostname("Raptor LT02 Line1");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SSID, PASSWORD);
+  Serial.println("Connecting to WiFi...");
+  
+  esp_mqtt_client_config_t mqtt_cfg = {};
+  mqtt_cfg.uri = "mqtt://test.mosquitto.org:1883";
+  mqtt_cfg.lwt_topic = "raptorfx02/fp2/" LINE_CODE "/status";
+  mqtt_cfg.lwt_msg = "offline";
+  mqtt_cfg.lwt_qos = 1;
+  mqtt_cfg.lwt_retain = 1;
+  mqtt_cfg.keepalive = 10;
+  
+  mqtt = esp_mqtt_client_init(&mqtt_cfg);
+  esp_mqtt_client_register_event(mqtt, MQTT_EVENT_ANY, mqtt_event_handler, NULL);
+  esp_mqtt_client_start(mqtt);
+}
+
+void loop() {
+  handle_wifi_loop();
+  static unsigned long lastSonarCheck = 0;
+  if (millis() - lastSonarCheck > 500) {
+    lastSonarCheck = millis();
+    unsigned int distance = sonar.ping_cm();
+    bool bucketNow = !distance;
+
+    // JIka bucket berubah status
+    if(bucketNow != line.bucket) {
+      line.bucket = bucketNow;
+      isLoaded = false;
+      Serial.print("Bucket status changed: ");
+      Serial.println(line.bucket);
+      if (wifiStatus == WL_CONNECTED) {
+        esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/bucket", line.bucket ? "true" : "false", 0, 1, 1);
+      }
+    }
+  }
+
+  static unsigned long loadButtonPressedAt = 0;
+  if(!line.bucket && !isLoaded) {
+    bool loadState = !digitalRead(PIN_LOAD_BUTTON);
+    if (loadState) {
+      if (!loadButtonPressedAt) {
+        loadButtonPressedAt = millis();
+      } else if (millis() - loadButtonPressedAt > LOAD_PRESS_TIME) {
+        isLoaded = true;
+        Serial.println("Bucket Loaded");
+        if (wifiStatus == WL_CONNECTED) {
+          esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/bucket", "true", 0, 1, 1);
+        }
+      }
+    } else {
+      loadButtonPressedAt = 0;
+    }
+  }
+  
+  bool emergencyState = !digitalRead(PIN_EMERGENCY_BUTTON);
+  if (emergencyState != line.emergency) {
+    line.emergency = emergencyState;
+    Serial.print("Emergency status changed: ");
+    Serial.println(line.emergency);
+    digitalWrite(PIN_LED, line.emergency ? HIGH : LOW);
+    if (wifiStatus == WL_CONNECTED) {
+      esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/emergency", line.emergency ? "true" : "false", 0, 1, 1);
+    }
+  }
+}
+
+void handle_mqtt_message(esp_mqtt_event_handle_t message){
+  Serial.print("MQTT data received: ");
+  Serial.write(message->topic, message->topic_len);
+  Serial.println();
+
+  Serial.print("Line 1 - Status: "); Serial.print(line.status); Serial.print(", Bucket: "); Serial.print(line.bucket); Serial.print(", Emergency: "); Serial.println(line.emergency);
+
+  Serial.println();
+  Serial.println();
+}
+
+void handle_wifi_loop() {
+  wifiStatus = WiFi.status();
+  static wl_status_t lastStatus = WL_IDLE_STATUS;
+  if (wifiStatus != lastStatus) {
+    lastStatus = wifiStatus;
+    switch (wifiStatus) {
+      case WL_NO_SSID_AVAIL:
+        Serial.println("WiFi: No SSID available");
+        break;
+      case WL_CONNECTED:
+        Serial.println("WiFi: Connected!");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+        break;
+      case WL_CONNECT_FAILED:
+        Serial.println("WiFi: Connection failed");
+        break;
+      case WL_CONNECTION_LOST:
+        Serial.println("WiFi: Connection lost");
+        break;
+      case WL_DISCONNECTED:
+        Serial.println("WiFi: Disconnected");
+        break;
+      default:
+        Serial.print("WiFi: Status changed to ");
+        Serial.println(wifiStatus);
+        break;
+    }
+  }
+}
+
+void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+  esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+  switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+      Serial.println("MQTT connected");
+      esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/status", "online", 0, 1, 1);
+      esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/bucket", isLoaded ? "true" : line.bucket ? "true" : "false", 0, 1, 1);
+      esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/emergency", line.emergency ? "true" : "false", 0, 1, 1);
+      esp_mqtt_client_subscribe(mqtt, "raptorfx02/fp2/status", 0);
+      break;
+    case MQTT_EVENT_DISCONNECTED:
+      Serial.println("MQTT disconnected");
+      break;
+    case MQTT_EVENT_SUBSCRIBED:
+      Serial.println("MQTT subscribed");
+      break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+      Serial.println("MQTT unsubscribed");
+      break;
+    case MQTT_EVENT_PUBLISHED:
+      Serial.println("MQTT published");
+      break;
+    case MQTT_EVENT_DATA:
+      handle_mqtt_message(event);
+      break;
+    case MQTT_EVENT_ERROR:
+      Serial.println("MQTT error");
+      break;
+    default:
+      Serial.printf("Other MQTT event id: %d\n", event->event_id);
+      break;
+    }
+}
+
