@@ -3,16 +3,16 @@
 #include <mqtt_client.h>
 #include <Wire.h>
 #include <NewPing.h>
+#include <DHT.h>
+#include "secrets.h"
 
-#define SSID "Sauron"
-#define PASSWORD "gamaujawab"
-#define LINE_CODE "line1"
-#define PIN_EMERGENCY_BUTTON 14
-#define PIN_LOAD_BUTTON 27
-#define PIN_LED 2
-#define PIN_TRIGGER 12
-#define PIN_ECHO 13
+#define PIN_EMERGENCY_BUTTON 26
+#define PIN_LOAD_BUTTON 25
+#define PIN_LED 12
+#define PIN_TRIGGER 14
+#define PIN_ECHO 27
 #define LOAD_PRESS_TIME 100
+#define PIN_DHT 13
 
 struct lineData {
   bool status;  
@@ -30,9 +30,17 @@ NewPing sonar(PIN_TRIGGER, PIN_ECHO, 30);
 
 wl_status_t wifiStatus;
 
+DHT dht(PIN_DHT, DHT11);
+int lastTemperature = -1;
+int lastHumidity = -1;
+
 void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
-void handle_wifi_loop();
 void handle_mqtt_message(esp_mqtt_event_handle_t message);
+void handle_wifi_loop();
+void handle_dht();
+void handle_sonar();
+void handle_find_btn();
+void handle_load_btn();
 
 void setup() {
   Serial.begin(115200);
@@ -40,14 +48,14 @@ void setup() {
   pinMode(PIN_EMERGENCY_BUTTON, INPUT_PULLUP);
   pinMode(PIN_LOAD_BUTTON, INPUT_PULLUP);
 
-  WiFi.setHostname("Raptor LT02 Line1");
+  WiFi.setHostname("Raptor LT02 Line2");
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASSWORD);
   Serial.println("Connecting to WiFi...");
   
   esp_mqtt_client_config_t mqtt_cfg = {};
-  mqtt_cfg.uri = "mqtt://test.mosquitto.org:1883";
-  mqtt_cfg.lwt_topic = "raptorfx02/fp2/" LINE_CODE "/status";
+  mqtt_cfg.uri = MQTT_URI;
+  mqtt_cfg.lwt_topic = "raptorfx02/" LINE_CODE "/status";
   mqtt_cfg.lwt_msg = "offline";
   mqtt_cfg.lwt_qos = 1;
   mqtt_cfg.lwt_retain = 1;
@@ -60,42 +68,63 @@ void setup() {
 
 void loop() {
   handle_wifi_loop();
+  handle_sonar();
+  handle_dht();
+  handle_find_btn();
+  handle_load_btn();
+}
+
+void handle_sonar(){
   static unsigned long lastSonarCheck = 0;
-  if (millis() - lastSonarCheck > 500) {
-    lastSonarCheck = millis();
-    unsigned int distance = sonar.ping_cm();
-    bool bucketNow = !distance;
+  if (millis() - lastSonarCheck < 500) return;
 
-    // JIka bucket berubah status
-    if(bucketNow != line.bucket) {
-      line.bucket = bucketNow;
-      isLoaded = false;
-      Serial.print("Bucket status changed: ");
-      Serial.println(line.bucket);
-      if (wifiStatus == WL_CONNECTED) {
-        esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/bucket", line.bucket ? "true" : "false", 0, 1, 1);
-      }
-    }
-  }
-
-  static unsigned long loadButtonPressedAt = 0;
-  if(!line.bucket && !isLoaded) {
-    bool loadState = !digitalRead(PIN_LOAD_BUTTON);
-    if (loadState) {
-      if (!loadButtonPressedAt) {
-        loadButtonPressedAt = millis();
-      } else if (millis() - loadButtonPressedAt > LOAD_PRESS_TIME) {
-        isLoaded = true;
-        Serial.println("Bucket Loaded");
-        if (wifiStatus == WL_CONNECTED) {
-          esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/bucket", "true", 0, 1, 1);
-        }
-      }
-    } else {
-      loadButtonPressedAt = 0;
+  lastSonarCheck = millis();
+  unsigned int distance = sonar.ping_cm();
+  bool bucketNow = !distance;
+  // JIka bucket berubah status
+  if(bucketNow != line.bucket) {
+    line.bucket = bucketNow;
+    isLoaded = false;
+    Serial.print("Bucket status changed: ");
+    Serial.println(line.bucket);
+    if (wifiStatus == WL_CONNECTED) {
+      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/bucket", line.bucket ? "1" : "0", 0, 1, 1);
     }
   }
   
+}
+
+void handle_dht(){
+  static unsigned long lastDHTCheck = 0;
+  if(millis() - lastDHTCheck < 3000) return;
+  lastDHTCheck = millis();
+  // Cek sensor suhu
+  int temperature = dht.readTemperature();
+  if(temperature != lastTemperature) {
+    lastTemperature = temperature;
+    Serial.print("Temperature: ");
+    Serial.println(temperature);
+    if (wifiStatus == WL_CONNECTED) {
+      char tempStr[8];
+      snprintf(tempStr, sizeof(tempStr), "%d", temperature);
+      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/temperature", tempStr, 0, 1, 1);
+    }
+  }
+  // Cek sensor kelembaban
+  int humidity = dht.readHumidity();
+  if(humidity != lastHumidity) {
+    lastHumidity = humidity;
+    Serial.print("Humidity: ");
+    Serial.println(humidity);
+    if (wifiStatus == WL_CONNECTED) {
+      char humStr[8];
+      snprintf(humStr, sizeof(humStr), "%d", humidity);
+      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/humidity", humStr, 0, 1, 1);
+    }
+  }
+}
+
+void handle_find_btn(){
   bool emergencyState = !digitalRead(PIN_EMERGENCY_BUTTON);
   if (emergencyState != line.emergency) {
     line.emergency = emergencyState;
@@ -103,8 +132,27 @@ void loop() {
     Serial.println(line.emergency);
     digitalWrite(PIN_LED, line.emergency ? HIGH : LOW);
     if (wifiStatus == WL_CONNECTED) {
-      esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/emergency", line.emergency ? "true" : "false", 0, 1, 1);
+      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/finding", line.emergency ? "1" : "0", 0, 1, 1);
     }
+  }
+}
+
+void handle_load_btn(){
+  if(line.bucket || isLoaded) return;
+  static unsigned long loadButtonPressedAt = 0;
+  bool loadState = !digitalRead(PIN_LOAD_BUTTON);
+  if (loadState) {
+    if (!loadButtonPressedAt) {
+      loadButtonPressedAt = millis();
+    } else if (millis() - loadButtonPressedAt > LOAD_PRESS_TIME) {
+      isLoaded = true;
+      Serial.println("Bucket Loaded");
+      if (wifiStatus == WL_CONNECTED) {
+        esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/bucket", "1", 0, 1, 1);
+      }
+    }
+    } else {
+      loadButtonPressedAt = 0;
   }
 }
 
@@ -113,7 +161,7 @@ void handle_mqtt_message(esp_mqtt_event_handle_t message){
   Serial.write(message->topic, message->topic_len);
   Serial.println();
 
-  Serial.print("Line 1 - Status: "); Serial.print(line.status); Serial.print(", Bucket: "); Serial.print(line.bucket); Serial.print(", Emergency: "); Serial.println(line.emergency);
+  Serial.print("Line 2 - Status: "); Serial.print(line.status); Serial.print(", Bucket: "); Serial.print(line.bucket); Serial.print(", Emergency: "); Serial.println(line.emergency);
 
   Serial.println();
   Serial.println();
@@ -155,10 +203,10 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
   switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
       Serial.println("MQTT connected");
-      esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/status", "online", 0, 1, 1);
-      esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/bucket", isLoaded ? "true" : line.bucket ? "true" : "false", 0, 1, 1);
-      esp_mqtt_client_publish(mqtt, "raptorfx02/fp2/" LINE_CODE "/emergency", line.emergency ? "true" : "false", 0, 1, 1);
-      esp_mqtt_client_subscribe(mqtt, "raptorfx02/fp2/status", 0);
+      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/status", "online", 0, 1, 1);
+      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/bucket", isLoaded ? "1" : line.bucket ? "1" : "0", 0, 1, 1);
+      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/finding", line.emergency ? "1" : "0", 0, 1, 1);
+      // esp_mqtt_client_subscribe(mqtt, "raptorfx02/status", 0);
       break;
     case MQTT_EVENT_DISCONNECTED:
       Serial.println("MQTT disconnected");
