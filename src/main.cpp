@@ -4,6 +4,8 @@
 #include <Wire.h>
 #include <NewPing.h>
 #include <DHT.h>
+#include <math.h>
+#include <limits.h>
 #include "secrets.h"
 
 #define PIN_EMERGENCY_BUTTON 26
@@ -30,9 +32,9 @@ NewPing sonar(PIN_TRIGGER, PIN_ECHO, 30);
 
 wl_status_t wifiStatus;
 
-DHT dht(PIN_DHT, DHT11);
-int lastTemperature = -1;
-int lastHumidity = -1;
+DHT dht(PIN_DHT, DHT22);
+int lastTemperature = INT_MIN;
+int lastHumidity = INT_MIN;
 
 void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 void handle_mqtt_message(esp_mqtt_event_handle_t message);
@@ -47,6 +49,8 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_EMERGENCY_BUTTON, INPUT_PULLUP);
   pinMode(PIN_LOAD_BUTTON, INPUT_PULLUP);
+
+  dht.begin();
 
   WiFi.setHostname("Raptor LT02 Line2");
   WiFi.mode(WIFI_STA);
@@ -99,27 +103,38 @@ void handle_dht(){
   if(millis() - lastDHTCheck < 3000) return;
   lastDHTCheck = millis();
   // Cek sensor suhu
-  int temperature = dht.readTemperature();
-  if(temperature != lastTemperature) {
-    lastTemperature = temperature;
-    Serial.print("Temperature: ");
-    Serial.println(temperature);
-    if (wifiStatus == WL_CONNECTED) {
-      char tempStr[8];
-      snprintf(tempStr, sizeof(tempStr), "%d", temperature);
-      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/temperature", tempStr, 0, 1, 1);
+  float temperature_f = dht.readTemperature();
+  if (isnan(temperature_f)) {
+    Serial.println("DHT: Failed to read temperature");
+  } else {
+    int temperature = (int)round(temperature_f);
+    if (temperature != lastTemperature) {
+      lastTemperature = temperature;
+      Serial.print("Temperature: ");
+      Serial.println(temperature);
+      if (wifiStatus == WL_CONNECTED) {
+        char tempStr[8];
+        snprintf(tempStr, sizeof(tempStr), "%d", temperature);
+        esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/temperature", tempStr, 0, 1, 1);
+      }
     }
   }
+
   // Cek sensor kelembaban
-  int humidity = dht.readHumidity();
-  if(humidity != lastHumidity) {
-    lastHumidity = humidity;
-    Serial.print("Humidity: ");
-    Serial.println(humidity);
-    if (wifiStatus == WL_CONNECTED) {
-      char humStr[8];
-      snprintf(humStr, sizeof(humStr), "%d", humidity);
-      esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/humidity", humStr, 0, 1, 1);
+  float humidity_f = dht.readHumidity();
+  if (isnan(humidity_f)) {
+    Serial.println("DHT: Failed to read humidity");
+  } else {
+    int humidity = (int)round(humidity_f);
+    if (humidity != lastHumidity) {
+      lastHumidity = humidity;
+      Serial.print("Humidity: ");
+      Serial.println(humidity);
+      if (wifiStatus == WL_CONNECTED) {
+        char humStr[8];
+        snprintf(humStr, sizeof(humStr), "%d", humidity);
+        esp_mqtt_client_publish(mqtt, "raptorfx02/" LINE_CODE "/humidity", humStr, 0, 1, 1);
+      }
     }
   }
 }
